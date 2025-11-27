@@ -1,0 +1,308 @@
+//////////////////////////////////////////////////////////////////////////////////
+// nvme_io_cmd.c for Cosmos+ OpenSSD
+// Copyright (c) 2016 Hanyang University ENC Lab.
+// Contributed by Yong Ho Song <yhsong@enc.hanyang.ac.kr>
+//				  Youngjin Jo <yjjo@enc.hanyang.ac.kr>
+//				  Sangjin Lee <sjlee@enc.hanyang.ac.kr>
+//				  Jaewook Kwak <jwkwak@enc.hanyang.ac.kr>
+//
+// This file is part of Cosmos+ OpenSSD.
+//
+// Cosmos+ OpenSSD is free software; you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation; either version 3, or (at your option)
+// any later version.
+//
+// Cosmos+ OpenSSD is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+// See the GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with Cosmos+ OpenSSD; see the file COPYING.
+// If not, see <http://www.gnu.org/licenses/>.
+//////////////////////////////////////////////////////////////////////////////////
+
+//////////////////////////////////////////////////////////////////////////////////
+// Company: ENC Lab. <http://enc.hanyang.ac.kr>
+// Engineer: Sangjin Lee <sjlee@enc.hanyang.ac.kr>
+//			 Jaewook Kwak <jwkwak@enc.hanyang.ac.kr>
+//
+// Project Name: Cosmos+ OpenSSD
+// Design Name: Cosmos+ Firmware
+// Module Name: NVMe IO Command Handler
+// File Name: nvme_io_cmd.c
+//
+// Version: v1.0.1
+//
+// Description:
+//   - handles NVMe IO command
+//////////////////////////////////////////////////////////////////////////////////
+
+//////////////////////////////////////////////////////////////////////////////////
+// Revision History:
+//
+// * v1.0.1
+//   - header file for buffer is changed from "ia_lru_buffer.h" to "lru_buffer.h"
+//
+// * v1.0.0
+//   - First draft
+//////////////////////////////////////////////////////////////////////////////////
+
+
+#include "xil_printf.h"
+#include "debug.h"
+#include "io_access.h"
+
+#include "nvme.h"
+#include "host_lld.h"
+#include "nvme_io_cmd.h"
+
+#include "../ftl_config.h"
+#include "../request_transform.h"
+#include "../address_translation.h"
+
+/* === Key-Value Store Implementation (ESS4116 Project 3) === */
+#define KEY_SIZE 4
+#define ENOSUCHKEY 0x7C1
+
+// Simple hash function: maps 4-byte key to LSA range
+static unsigned int HashKeyToLSA(unsigned int key)
+{
+	// MurmurHash3-inspired 32-bit finalizer
+	unsigned int hash = key;
+	hash ^= (hash >> 16);
+	hash *= 0x85ebca6b;
+	hash ^= (hash >> 13);
+	hash *= 0xc2b2ae35;
+	hash ^= (hash >> 16);
+	return hash % SLICES_PER_SSD;
+}
+/* ========================================================== */
+void handle_nvme_io_read(unsigned int cmdSlotTag, NVME_IO_COMMAND *nvmeIOCmd)
+{
+	IO_READ_COMMAND_DW12 readInfo12;
+	//IO_READ_COMMAND_DW13 readInfo13;
+	//IO_READ_COMMAND_DW15 readInfo15;
+	unsigned int startLba[2];
+	unsigned int nlb;
+	unsigned int nsid = nvmeIOCmd->NSID;
+	
+
+	readInfo12.dword = nvmeIOCmd->dword[12];
+	//readInfo13.dword = nvmeIOCmd->dword[13];
+	//readInfo15.dword = nvmeIOCmd->dword[15];
+
+	startLba[0] = nvmeIOCmd->dword[10];
+	startLba[1] = nvmeIOCmd->dword[11];
+	nlb = readInfo12.NLB;
+
+	ASSERT(startLba[0] < storageCapacity_L / USER_CHANNELS && (startLba[1] < STORAGE_CAPACITY_H || startLba[1] == 0));
+	//ASSERT(nlb < MAX_NUM_OF_NLB);
+	ASSERT((nvmeIOCmd->PRP1[0] & 0x3) == 0 && (nvmeIOCmd->PRP2[0] & 0x3) == 0); //error
+	ASSERT(nvmeIOCmd->PRP1[1] < 0x10000 && nvmeIOCmd->PRP2[1] < 0x10000);
+
+	ReqTransNvmeToSlice(cmdSlotTag, startLba[0] + (storageCapacity_L / USER_CHANNELS) * (nsid - 1), nlb, IO_NVM_READ);
+}
+
+
+void handle_nvme_io_write(unsigned int cmdSlotTag, NVME_IO_COMMAND *nvmeIOCmd)
+{
+	IO_READ_COMMAND_DW12 writeInfo12;
+	//IO_READ_COMMAND_DW13 writeInfo13;
+	//IO_READ_COMMAND_DW15 writeInfo15;
+	unsigned int startLba[2];
+	unsigned int nlb;
+	unsigned int nsid = nvmeIOCmd->NSID;
+
+	writeInfo12.dword = nvmeIOCmd->dword[12];
+	//writeInfo13.dword = nvmeIOCmd->dword[13];
+	//writeInfo15.dword = nvmeIOCmd->dword[15];
+
+	//if(writeInfo12.FUA == 1)
+	//	xil_printf("write FUA\r\n");
+
+	startLba[0] = nvmeIOCmd->dword[10];
+	startLba[1] = nvmeIOCmd->dword[11];
+	nlb = writeInfo12.NLB;
+
+	ASSERT(startLba[0] < storageCapacity_L / USER_CHANNELS && (startLba[1] < STORAGE_CAPACITY_H || startLba[1] == 0));
+	//ASSERT(nlb < MAX_NUM_OF_NLB);
+	ASSERT((nvmeIOCmd->PRP1[0] & 0xF) == 0 && (nvmeIOCmd->PRP2[0] & 0xF) == 0);
+	ASSERT(nvmeIOCmd->PRP1[1] < 0x10000 && nvmeIOCmd->PRP2[1] < 0x10000);
+
+	ReqTransNvmeToSlice(cmdSlotTag, startLba[0] + (storageCapacity_L / USER_CHANNELS) * (nsid - 1), nlb, IO_NVM_WRITE);
+}
+
+/* === Key-Value Store Handlers (ESS4116 Project 3) === */
+void handle_nvme_io_kv_put(unsigned int cmdSlotTag, NVME_IO_COMMAND *nvmeIOCmd)
+{
+	unsigned int key = nvmeIOCmd->dword[10];        // cdw10: 4-byte key
+	unsigned int nlb = nvmeIOCmd->dword[12];        // cdw12: number of logical blocks (slices)
+	// unsigned int valueSize = nvmeIOCmd->dword[13]; // cdw13: actual value size (not used in minimal impl)
+	
+	// Hash key to logical slice address
+	unsigned int lsa = HashKeyToLSA(key);
+	
+	// Reuse existing write path
+	ReqTransNvmeToSlice(cmdSlotTag, lsa, nlb, IO_NVM_WRITE);
+}
+
+void handle_nvme_io_kv_get(unsigned int cmdSlotTag, NVME_IO_COMMAND *nvmeIOCmd)
+{
+	NVME_COMPLETION nvmeCPL;
+	unsigned int key = nvmeIOCmd->dword[10];
+	unsigned int nlb = nvmeIOCmd->dword[12];
+	
+	// Hash key to logical slice address
+	unsigned int lsa = HashKeyToLSA(key);
+	
+	// Check if key exists
+	if (logicalSliceMapPtr->logicalSlice[lsa].virtualSliceAddr == VSA_NONE) {
+		// Key not found - return NVMe error immediately
+		nvmeCPL.dword[0] = 0;
+		nvmeCPL.statusField.SCT = SCT_GENERIC_COMMAND_STATUS;
+		nvmeCPL.statusField.SC = ENOSUCHKEY;
+		set_auto_nvme_cpl(cmdSlotTag, 0, nvmeCPL.statusFieldWord);
+		return;
+	}
+	
+	ASSERT((nvmeIOCmd->PRP1[0] & 0x3) == 0 && (nvmeIOCmd->PRP2[0] & 0x3) == 0);
+	ASSERT(nvmeIOCmd->PRP1[1] < 0x10000 && nvmeIOCmd->PRP2[1] < 0x10000);
+	
+	// Mark this as KV GET request (DMA handler will set result=4KB)
+	g_kv_get_flag[cmdSlotTag] = 1;
+
+	// Reuse existing read path
+	ReqTransNvmeToSlice(cmdSlotTag, lsa, nlb, IO_NVM_READ);
+}
+/* ==================================================== */
+
+/* === Block-Level FTL (ESS4116) === */
+void handle_nvme_io_mapping_info()
+{
+	unsigned int validLogicalCnt = 0;
+	unsigned int validVirtualCnt = 0;
+
+	for (unsigned int i = 0; i < SLICES_PER_SSD; i++) {
+		if (logicalSliceMapPtr->logicalSlice[i].virtualSliceAddr != VSA_NONE)
+			validLogicalCnt++;
+
+		if (virtualSliceMapPtr->virtualSlice[i].logicalSliceAddr != LSA_NONE)
+			validVirtualCnt++;
+	}
+
+	unsigned int mappedBlockCnt = 0;
+	unsigned int totalLogicalBlocks = SLICES_PER_SSD / SLICES_PER_BLOCK;
+	static unsigned char seenBlock[USER_BLOCKS_PER_SSD] = {0};
+	memset(seenBlock, 0, sizeof(seenBlock));
+
+	for (unsigned int i = 0; i < SLICES_PER_SSD; i++) {
+		unsigned int vsa = logicalSliceMapPtr->logicalSlice[i].virtualSliceAddr;
+		if (vsa != VSA_NONE) {
+			unsigned int die = Vsa2VdieTranslation(vsa);
+			unsigned int blk = Vsa2VblockTranslation(vsa);
+			unsigned int globalBlkIdx = die * USER_BLOCKS_PER_DIE + blk;
+
+			if (!seenBlock[globalBlkIdx]) {
+				seenBlock[globalBlkIdx] = 1;
+				mappedBlockCnt++;
+			}
+		}
+	}
+
+	unsigned int freeBlkCnt = 0;
+	unsigned int invalidSum = 0;
+	unsigned int blockCnt = 0;
+
+	for (unsigned int d = 0; d < USER_DIES; d++) {
+		freeBlkCnt += virtualDieMapPtr->die[d].freeBlockCnt;
+		for (unsigned int b = 0; b < USER_BLOCKS_PER_DIE; b++) {
+			invalidSum += virtualBlockMapPtr->block[d][b].invalidSliceCnt;
+			blockCnt++;
+		}
+	}
+
+	xil_printf("-----------------------------------------------------\r\n");
+	xil_printf("[FTL] Mapping Table Summary\r\n");
+	xil_printf("-----------------------------------------------------\r\n");
+	xil_printf(" Valid logicalSliceMap entries : %u / %u\r\n", validLogicalCnt, SLICES_PER_SSD);
+	xil_printf(" Valid virtualSliceMap entries : %u / %u\r\n", validVirtualCnt, SLICES_PER_SSD);
+	xil_printf(" Unique mapped blocks          : %u / %u\r\n", mappedBlockCnt, totalLogicalBlocks);
+	xil_printf("-----------------------------------------------------\r\n");
+	xil_printf("[FTL] Space Utilization\r\n");
+	xil_printf("-----------------------------------------------------\r\n");
+	xil_printf(" Free blocks remaining         : %u\r\n", freeBlkCnt);
+	xil_printf("-----------------------------------------------------\r\n");
+}
+/* ================================= */
+
+void handle_nvme_io_cmd(NVME_COMMAND *nvmeCmd)
+{
+	NVME_IO_COMMAND *nvmeIOCmd;
+	NVME_COMPLETION nvmeCPL;
+	unsigned int opc;
+	nvmeIOCmd = (NVME_IO_COMMAND*)nvmeCmd->cmdDword;
+	/*		xil_printf("OPC = 0x%X\r\n", nvmeIOCmd->OPC);
+			xil_printf("PRP1[63:32] = 0x%X, PRP1[31:0] = 0x%X\r\n", nvmeIOCmd->PRP1[1], nvmeIOCmd->PRP1[0]);
+			xil_printf("PRP2[63:32] = 0x%X, PRP2[31:0] = 0x%X\r\n", nvmeIOCmd->PRP2[1], nvmeIOCmd->PRP2[0]);
+			xil_printf("dword10 = 0x%X\r\n", nvmeIOCmd->dword10);
+			xil_printf("dword11 = 0x%X\r\n", nvmeIOCmd->dword11);
+			xil_printf("dword12 = 0x%X\r\n", nvmeIOCmd->dword12);*/
+
+
+	opc = (unsigned int)nvmeIOCmd->OPC;
+
+	switch(opc)
+	{
+		case IO_NVM_FLUSH:
+		{
+		//	xil_printf("IO Flush Command\r\n");
+			nvmeCPL.dword[0] = 0;
+			nvmeCPL.specific = 0x0;
+			set_auto_nvme_cpl(nvmeCmd->cmdSlotTag, nvmeCPL.specific, nvmeCPL.statusFieldWord);
+			break;
+		}
+		case IO_NVM_WRITE:
+		{
+//			xil_printf("IO Write Command\r\n");
+			handle_nvme_io_write(nvmeCmd->cmdSlotTag, nvmeIOCmd);
+			break;
+		}
+		case IO_NVM_READ:
+		{
+//			xil_printf("IO Read Command\r\n");
+			handle_nvme_io_read(nvmeCmd->cmdSlotTag, nvmeIOCmd);
+			break;
+		}
+		/* === Block-Level FTL (ESS4116) === */
+		case IO_NVM_FTL_MAP:
+		{
+			handle_nvme_io_mapping_info();
+			nvmeCPL.dword[0] = 0;
+			nvmeCPL.specific = 0x0;
+			set_auto_nvme_cpl(nvmeCmd->cmdSlotTag, nvmeCPL.specific, nvmeCPL.statusFieldWord);
+			break;
+		}
+		/* ================================= */
+		/* === Key-Value Store Commands (ESS4116 Project 3) === */
+		case IO_NVM_KV_PUT:
+		{
+			handle_nvme_io_kv_put(nvmeCmd->cmdSlotTag, nvmeIOCmd);
+			break;
+		}
+		case IO_NVM_KV_GET:
+		{
+			handle_nvme_io_kv_get(nvmeCmd->cmdSlotTag, nvmeIOCmd);
+			break;
+		}
+		/* ==================================================== */
+		default:
+		{
+			xil_printf("Not Support IO Command OPC: %X\r\n", opc);
+			ASSERT(0);
+			break;
+		}
+	}
+}
+
