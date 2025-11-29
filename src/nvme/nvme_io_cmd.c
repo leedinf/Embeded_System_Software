@@ -159,22 +159,19 @@ void handle_nvme_io_kv_get(unsigned int cmdSlotTag, NVME_IO_COMMAND *nvmeIOCmd)
 	
 	// Check if key exists
 	if (logicalSliceMapPtr->logicalSlice[lsa].virtualSliceAddr == VSA_NONE) {
-		// Key not found - return NVMe error immediately
-		nvmeCPL.dword[0] = 0;
-		nvmeCPL.statusField.SCT = SCT_GENERIC_COMMAND_STATUS;
-		nvmeCPL.statusField.SC = ENOSUCHKEY;
-		set_auto_nvme_cpl(cmdSlotTag, 0, nvmeCPL.statusFieldWord);
+		// Key not found - return error code in specific field
+		set_auto_nvme_cpl(cmdSlotTag, ENOSUCHKEY, 0);  // specific = ENOSUCHKEY (0x7C1)
 		return;
 	}
 	
 	ASSERT((nvmeIOCmd->PRP1[0] & 0x3) == 0 && (nvmeIOCmd->PRP2[0] & 0x3) == 0);
 	ASSERT(nvmeIOCmd->PRP1[1] < 0x10000 && nvmeIOCmd->PRP2[1] < 0x10000);
 	
-	// Mark this as KV GET request (DMA handler will set result=4KB)
-	g_kv_get_flag[cmdSlotTag] = 1;
-
-	// Reuse existing read path
-	ReqTransNvmeToSlice(cmdSlotTag, lsa, nlb, IO_NVM_READ);
+	// Queue KV GET request to FTL pipeline with auto-completion disabled
+	// DMA will complete without hardware auto-completion
+	// Manual completion must be sent later with specific=4096 (data length)
+	ReqTransNvmeToSliceKvGet(cmdSlotTag, lsa, nlb);
+}
 }
 /* ==================================================== */
 

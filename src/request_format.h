@@ -67,6 +67,7 @@
 #define REQ_CODE_RESET				0x0D
 #define REQ_CODE_SET_FEATURE		0x0E
 #define REQ_CODE_FLUSH				0x0F
+#define REQ_CODE_KV_GET				0x11	// KV GET - no auto-completion
 #define REQ_CODE_RxDMA				0x10
 #define REQ_CODE_TxDMA				0x20
 
@@ -146,7 +147,8 @@ typedef struct _REQ_OPTION{
 	unsigned int nandEccWarning : 1;
 	unsigned int rowAddrDependencyCheck : 1;
 	unsigned int blockSpace : 1;
-	unsigned int reserved0 : 24;
+	unsigned int isKvGet : 1;  // KV GET flag - set to disable auto-completion
+	unsigned int reserved0 : 23;
 } REQ_OPTION, *P_REQ_OPTION;
 
 

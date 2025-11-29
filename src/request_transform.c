@@ -158,6 +158,84 @@ void ReqTransNvmeToSlice(unsigned int cmdSlotTag, unsigned int startLba, unsigne
 }
 
 
+void ReqTransNvmeToSliceKvGet(unsigned int cmdSlotTag, unsigned int startLba, unsigned int nlb)
+{
+	unsigned int reqSlotTag, requestedNvmeBlock, tempNumOfNvmeBlock, transCounter, tempLsa, loop, nvmeBlockOffset, nvmeDmaStartIndex;
+
+	requestedNvmeBlock = nlb + 1;
+	transCounter = 0;
+	nvmeDmaStartIndex = 0;
+	tempLsa = startLba / NVME_BLOCKS_PER_SLICE;
+	loop = ((startLba % NVME_BLOCKS_PER_SLICE) + requestedNvmeBlock) / NVME_BLOCKS_PER_SLICE;
+
+	//first transform
+	nvmeBlockOffset = (startLba % NVME_BLOCKS_PER_SLICE);
+	if(loop)
+		tempNumOfNvmeBlock = NVME_BLOCKS_PER_SLICE - nvmeBlockOffset;
+	else
+		tempNumOfNvmeBlock = requestedNvmeBlock;
+
+	reqSlotTag = GetFromFreeReqQ();
+
+	reqPoolPtr->reqPool[reqSlotTag].reqType = REQ_TYPE_SLICE;
+	reqPoolPtr->reqPool[reqSlotTag].reqCode = REQ_CODE_KV_GET;  // KV GET code - no auto-completion
+	reqPoolPtr->reqPool[reqSlotTag].nvmeCmdSlotTag = cmdSlotTag;
+	reqPoolPtr->reqPool[reqSlotTag].logicalSliceAddr = tempLsa;
+	reqPoolPtr->reqPool[reqSlotTag].nvmeDmaInfo.startIndex = nvmeDmaStartIndex;
+	reqPoolPtr->reqPool[reqSlotTag].nvmeDmaInfo.nvmeBlockOffset = nvmeBlockOffset;
+	reqPoolPtr->reqPool[reqSlotTag].nvmeDmaInfo.numOfNvmeBlock = tempNumOfNvmeBlock;
+	reqPoolPtr->reqPool[reqSlotTag].reqOpt.isKvGet = 1;  // Mark as KV GET for auto-completion disable
+
+	PutToSliceReqQ(reqSlotTag);
+
+	tempLsa++;
+	transCounter++;
+	nvmeDmaStartIndex += tempNumOfNvmeBlock;
+
+	//transform continue
+	while(transCounter < loop)
+	{
+		nvmeBlockOffset = 0;
+		tempNumOfNvmeBlock = NVME_BLOCKS_PER_SLICE;
+
+		reqSlotTag = GetFromFreeReqQ();
+
+		reqPoolPtr->reqPool[reqSlotTag].reqType = REQ_TYPE_SLICE;
+		reqPoolPtr->reqPool[reqSlotTag].reqCode = REQ_CODE_KV_GET;  // KV GET code - no auto-completion
+		reqPoolPtr->reqPool[reqSlotTag].nvmeCmdSlotTag = cmdSlotTag;
+		reqPoolPtr->reqPool[reqSlotTag].logicalSliceAddr = tempLsa;
+		reqPoolPtr->reqPool[reqSlotTag].nvmeDmaInfo.startIndex = nvmeDmaStartIndex;
+		reqPoolPtr->reqPool[reqSlotTag].nvmeDmaInfo.nvmeBlockOffset = nvmeBlockOffset;
+		reqPoolPtr->reqPool[reqSlotTag].nvmeDmaInfo.numOfNvmeBlock = tempNumOfNvmeBlock;
+		reqPoolPtr->reqPool[reqSlotTag].reqOpt.isKvGet = 1;  // Mark as KV GET for auto-completion disable
+
+		PutToSliceReqQ(reqSlotTag);
+
+		tempLsa++;
+		transCounter++;
+		nvmeDmaStartIndex += tempNumOfNvmeBlock;
+	}
+
+	//last transform
+	nvmeBlockOffset = 0;
+	tempNumOfNvmeBlock = (startLba + requestedNvmeBlock) % NVME_BLOCKS_PER_SLICE;
+	if((tempNumOfNvmeBlock == 0) || (loop == 0))
+		return ;
+
+	reqSlotTag = GetFromFreeReqQ();
+
+	reqPoolPtr->reqPool[reqSlotTag].reqType = REQ_TYPE_SLICE;
+	reqPoolPtr->reqPool[reqSlotTag].reqCode = REQ_CODE_KV_GET;  // KV GET code - no auto-completion
+	reqPoolPtr->reqPool[reqSlotTag].nvmeCmdSlotTag = cmdSlotTag;
+	reqPoolPtr->reqPool[reqSlotTag].logicalSliceAddr = tempLsa;
+	reqPoolPtr->reqPool[reqSlotTag].nvmeDmaInfo.startIndex = nvmeDmaStartIndex;
+	reqPoolPtr->reqPool[reqSlotTag].nvmeDmaInfo.nvmeBlockOffset = nvmeBlockOffset;
+	reqPoolPtr->reqPool[reqSlotTag].nvmeDmaInfo.numOfNvmeBlock = tempNumOfNvmeBlock;
+	reqPoolPtr->reqPool[reqSlotTag].reqOpt.isKvGet = 1;  // Mark as KV GET for auto-completion disable
+
+	PutToSliceReqQ(reqSlotTag);
+}
+
 
 void EvictDataBufEntry(unsigned int originReqSlotTag)
 {
@@ -249,25 +327,29 @@ void ReqTransSliceToLowLevel()
 			dataBufMapPtr->dataBuf[dataBufEntry].logicalSliceAddr = reqPoolPtr->reqPool[reqSlotTag].logicalSliceAddr;
 			PutToDataBufHashList(dataBufEntry);
 
-			if(reqPoolPtr->reqPool[reqSlotTag].reqCode  == REQ_CODE_READ)
+		if(reqPoolPtr->reqPool[reqSlotTag].reqCode  == REQ_CODE_READ)
+			DataReadFromNand(reqSlotTag);
+		else if(reqPoolPtr->reqPool[reqSlotTag].reqCode  == REQ_CODE_WRITE)
+			if(reqPoolPtr->reqPool[reqSlotTag].nvmeDmaInfo.numOfNvmeBlock != NVME_BLOCKS_PER_SLICE) //for read modify write
 				DataReadFromNand(reqSlotTag);
-			else if(reqPoolPtr->reqPool[reqSlotTag].reqCode  == REQ_CODE_WRITE)
-				if(reqPoolPtr->reqPool[reqSlotTag].nvmeDmaInfo.numOfNvmeBlock != NVME_BLOCKS_PER_SLICE) //for read modify write
-					DataReadFromNand(reqSlotTag);
+		else if(reqPoolPtr->reqPool[reqSlotTag].reqCode  == REQ_CODE_KV_GET)
+			DataReadFromNand(reqSlotTag);  // KV GET also needs NAND read
 		}
 
-		//transform this slice request to nvme request
-		if(reqPoolPtr->reqPool[reqSlotTag].reqCode  == REQ_CODE_WRITE)
-		{
-			dataBufMapPtr->dataBuf[dataBufEntry].dirty = DATA_BUF_DIRTY;
-			reqPoolPtr->reqPool[reqSlotTag].reqCode = REQ_CODE_RxDMA;
-		}
-		else if(reqPoolPtr->reqPool[reqSlotTag].reqCode  == REQ_CODE_READ)
-			reqPoolPtr->reqPool[reqSlotTag].reqCode = REQ_CODE_TxDMA;
-		else
-			assert(!"[WARNING] Not supported reqCode. [WARNING]");
-
-		reqPoolPtr->reqPool[reqSlotTag].reqType = REQ_TYPE_NVME_DMA;
+	//transform this slice request to nvme request
+	if(reqPoolPtr->reqPool[reqSlotTag].reqCode  == REQ_CODE_WRITE)
+	{
+		dataBufMapPtr->dataBuf[dataBufEntry].dirty = DATA_BUF_DIRTY;
+		reqPoolPtr->reqPool[reqSlotTag].reqCode = REQ_CODE_RxDMA;
+	}
+	else if(reqPoolPtr->reqPool[reqSlotTag].reqCode  == REQ_CODE_READ)
+		reqPoolPtr->reqPool[reqSlotTag].reqCode = REQ_CODE_TxDMA;
+	else if(reqPoolPtr->reqPool[reqSlotTag].reqCode  == REQ_CODE_KV_GET)
+	{
+		reqPoolPtr->reqPool[reqSlotTag].reqCode = REQ_CODE_TxDMA;  // KV GET uses TxDMA but with auto-completion disabled
+	}
+	else
+		assert(!"[WARNING] Not supported reqCode. [WARNING]");		reqPoolPtr->reqPool[reqSlotTag].reqType = REQ_TYPE_NVME_DMA;
 		reqPoolPtr->reqPool[reqSlotTag].reqOpt.dataBufFormat = REQ_OPT_DATA_BUF_ENTRY;
 
 		UpdateDataBufEntryInfoBlockingReq(dataBufEntry, reqSlotTag);
@@ -574,7 +656,7 @@ void ReleaseBlockedByRowAddrDepReq(unsigned int chNo, unsigned int wayNo)
 
 void IssueNvmeDmaReq(unsigned int reqSlotTag)
 {
-	unsigned int devAddr, dmaIndex, numOfNvmeBlock;
+	unsigned int devAddr, dmaIndex, numOfNvmeBlock, autoCompletion;
 
 	dmaIndex = reqPoolPtr->reqPool[reqSlotTag].nvmeDmaInfo.startIndex;
 	devAddr = GenerateDataBufAddr(reqSlotTag);
@@ -595,9 +677,12 @@ void IssueNvmeDmaReq(unsigned int reqSlotTag)
 	}
 	else if(reqPoolPtr->reqPool[reqSlotTag].reqCode == REQ_CODE_TxDMA)
 	{
+		// Determine auto-completion: disable for KV GET, enable for regular READ
+		autoCompletion = (reqPoolPtr->reqPool[reqSlotTag].reqOpt.isKvGet) ? NVME_COMMAND_AUTO_COMPLETION_OFF : NVME_COMMAND_AUTO_COMPLETION_ON;
+		
 		while(numOfNvmeBlock < reqPoolPtr->reqPool[reqSlotTag].nvmeDmaInfo.numOfNvmeBlock)
 		{
-			set_auto_tx_dma(reqPoolPtr->reqPool[reqSlotTag].nvmeCmdSlotTag, dmaIndex, devAddr, NVME_COMMAND_AUTO_COMPLETION_ON);
+			set_auto_tx_dma(reqPoolPtr->reqPool[reqSlotTag].nvmeCmdSlotTag, dmaIndex, devAddr, autoCompletion);
 
 			numOfNvmeBlock++;
 			dmaIndex++;
@@ -637,7 +722,16 @@ void CheckDoneNvmeDmaReq()
 				txDone = check_auto_tx_dma_partial_done(reqPoolPtr->reqPool[reqSlotTag].nvmeDmaInfo.reqTail , reqPoolPtr->reqPool[reqSlotTag].nvmeDmaInfo.overFlowCnt);
 
 			if(txDone)
+			{
+				// For KV GET requests with auto-completion disabled, send manual completion
+				if(reqPoolPtr->reqPool[reqSlotTag].reqOpt.isKvGet)
+				{
+					// Send completion with specific field = 4096 (data length)
+					set_auto_nvme_cpl(reqPoolPtr->reqPool[reqSlotTag].nvmeCmdSlotTag, 4096, 0);
+				}
+				
 				SelectiveGetFromNvmeDmaReqQ(reqSlotTag);
+			}
 		}
 
 		reqSlotTag = prevReq;
