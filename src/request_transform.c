@@ -108,6 +108,7 @@ void ReqTransNvmeToSlice(unsigned int cmdSlotTag, unsigned int startLba, unsigne
 	reqPoolPtr->reqPool[reqSlotTag].nvmeDmaInfo.startIndex = nvmeDmaStartIndex;
 	reqPoolPtr->reqPool[reqSlotTag].nvmeDmaInfo.nvmeBlockOffset = nvmeBlockOffset;
 	reqPoolPtr->reqPool[reqSlotTag].nvmeDmaInfo.numOfNvmeBlock = tempNumOfNvmeBlock;
+	reqPoolPtr->reqPool[reqSlotTag].reqOpt.isKvGet = 0;  
 
 	PutToSliceReqQ(reqSlotTag);
 
@@ -130,6 +131,7 @@ void ReqTransNvmeToSlice(unsigned int cmdSlotTag, unsigned int startLba, unsigne
 		reqPoolPtr->reqPool[reqSlotTag].nvmeDmaInfo.startIndex = nvmeDmaStartIndex;
 		reqPoolPtr->reqPool[reqSlotTag].nvmeDmaInfo.nvmeBlockOffset = nvmeBlockOffset;
 		reqPoolPtr->reqPool[reqSlotTag].nvmeDmaInfo.numOfNvmeBlock = tempNumOfNvmeBlock;
+		reqPoolPtr->reqPool[reqSlotTag].reqOpt.isKvGet = 0;
 
 		PutToSliceReqQ(reqSlotTag);
 
@@ -153,7 +155,8 @@ void ReqTransNvmeToSlice(unsigned int cmdSlotTag, unsigned int startLba, unsigne
 	reqPoolPtr->reqPool[reqSlotTag].nvmeDmaInfo.startIndex = nvmeDmaStartIndex;
 	reqPoolPtr->reqPool[reqSlotTag].nvmeDmaInfo.nvmeBlockOffset = nvmeBlockOffset;
 	reqPoolPtr->reqPool[reqSlotTag].nvmeDmaInfo.numOfNvmeBlock = tempNumOfNvmeBlock;
-
+	reqPoolPtr->reqPool[reqSlotTag].reqOpt.isKvGet = 0;
+	
 	PutToSliceReqQ(reqSlotTag);
 }
 
@@ -327,13 +330,13 @@ void ReqTransSliceToLowLevel()
 			dataBufMapPtr->dataBuf[dataBufEntry].logicalSliceAddr = reqPoolPtr->reqPool[reqSlotTag].logicalSliceAddr;
 			PutToDataBufHashList(dataBufEntry);
 
-		if(reqPoolPtr->reqPool[reqSlotTag].reqCode  == REQ_CODE_READ)
+		if(reqPoolPtr->reqPool[reqSlotTag].reqCode  == REQ_CODE_READ || reqPoolPtr->reqPool[reqSlotTag].reqCode  == REQ_CODE_KV_GET)
 			DataReadFromNand(reqSlotTag);
 		else if(reqPoolPtr->reqPool[reqSlotTag].reqCode  == REQ_CODE_WRITE)
 			if(reqPoolPtr->reqPool[reqSlotTag].nvmeDmaInfo.numOfNvmeBlock != NVME_BLOCKS_PER_SLICE) //for read modify write
 				DataReadFromNand(reqSlotTag);
-		else if(reqPoolPtr->reqPool[reqSlotTag].reqCode  == REQ_CODE_KV_GET)
-			DataReadFromNand(reqSlotTag);  // KV GET also needs NAND read
+			// else if(reqPoolPtr->reqPool[reqSlotTag].reqCode  == REQ_CODE_KV_GET)	
+			// 	DataReadFromNand(reqSlotTag); << I had a headache cuz it was here
 		}
 
 	//transform this slice request to nvme request
@@ -349,11 +352,13 @@ void ReqTransSliceToLowLevel()
 		reqPoolPtr->reqPool[reqSlotTag].reqCode = REQ_CODE_TxDMA;  // KV GET uses TxDMA but with auto-completion disabled
 	}
 	else
-		assert(!"[WARNING] Not supported reqCode. [WARNING]");		reqPoolPtr->reqPool[reqSlotTag].reqType = REQ_TYPE_NVME_DMA;
-		reqPoolPtr->reqPool[reqSlotTag].reqOpt.dataBufFormat = REQ_OPT_DATA_BUF_ENTRY;
+		assert(!"[WARNING] Not supported reqCode. [WARNING]");		
+	reqPoolPtr->reqPool[reqSlotTag].reqType = REQ_TYPE_NVME_DMA;
+	reqPoolPtr->reqPool[reqSlotTag].reqOpt.dataBufFormat = REQ_OPT_DATA_BUF_ENTRY;
 
-		UpdateDataBufEntryInfoBlockingReq(dataBufEntry, reqSlotTag);
-		SelectLowLevelReqQ(reqSlotTag);
+	UpdateDataBufEntryInfoBlockingReq(dataBufEntry, reqSlotTag);
+	SelectLowLevelReqQ(reqSlotTag);
+	
 	}
 }
 
@@ -678,10 +683,10 @@ void IssueNvmeDmaReq(unsigned int reqSlotTag)
 	else if(reqPoolPtr->reqPool[reqSlotTag].reqCode == REQ_CODE_TxDMA)
 	{
 		// Determine auto-completion: disable for KV GET, enable for regular READ
-		autoCompletion = (reqPoolPtr->reqPool[reqSlotTag].reqOpt.isKvGet) ? NVME_COMMAND_AUTO_COMPLETION_OFF : NVME_COMMAND_AUTO_COMPLETION_ON;
 		
 		while(numOfNvmeBlock < reqPoolPtr->reqPool[reqSlotTag].nvmeDmaInfo.numOfNvmeBlock)
 		{
+			autoCompletion = (reqPoolPtr->reqPool[reqSlotTag].reqOpt.isKvGet) ? NVME_COMMAND_AUTO_COMPLETION_OFF : NVME_COMMAND_AUTO_COMPLETION_ON;
 			set_auto_tx_dma(reqPoolPtr->reqPool[reqSlotTag].nvmeCmdSlotTag, dmaIndex, devAddr, autoCompletion);
 
 			numOfNvmeBlock++;
@@ -727,7 +732,10 @@ void CheckDoneNvmeDmaReq()
 				if(reqPoolPtr->reqPool[reqSlotTag].reqOpt.isKvGet)
 				{
 					// Send completion with specific field = 4096 (data length)
-					set_auto_nvme_cpl(reqPoolPtr->reqPool[reqSlotTag].nvmeCmdSlotTag, 4096, 0);
+					NVME_COMPLETION nvmeCpl;
+					nvmeCpl.dword[0] = 0;
+					nvmeCpl.specific = 4096;
+					set_auto_nvme_cpl(reqPoolPtr->reqPool[reqSlotTag].nvmeCmdSlotTag, nvmeCpl.specific, nvmeCpl.statusFieldWord);
 				}
 				
 				SelectiveGetFromNvmeDmaReqQ(reqSlotTag);

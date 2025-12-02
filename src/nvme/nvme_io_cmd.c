@@ -53,6 +53,7 @@
 #include "xil_printf.h"
 #include "debug.h"
 #include "io_access.h"
+#include "../memory_map.h"
 
 #include "nvme.h"
 #include "host_lld.h"
@@ -69,28 +70,30 @@
 // Simple in-memory KV index (open-addressing, linear probing)
 // This is a lightweight index for mapping 4-byte keys -> LSA (logical slice addr)
 // It is not persistent across power cycles; it's an in-memory acceleration structure.
-#define KV_INDEX_SIZE (SLICES_PER_SSD) // 4,194,304 
+#define KV_INDEX_SIZE (2000001u) // 4,194,304 
 
 typedef struct {
 	unsigned int key; // 0xFFFFFFFF = empty
-	unsigned int lba;
+	// unsigned int lba;
 } KV_INDEX_ENTRY;
 
-static KV_INDEX_ENTRY kvIndex[KV_INDEX_SIZE];
+static KV_INDEX_ENTRY *kvIndex;
 static unsigned int kvIndex_inited = 0;
-
+static KV_INDEX_ENTRY checkInvalid[RESERVED0_START_ADDR + KV_INDEX_SIZE*sizeof(KV_INDEX_ENTRY)>=RESERVED0_END_ADDR?-1:1];
 static void kv_index_init(void)
 {
+	kvIndex = (KV_INDEX_ENTRY *)RESERVED0_START_ADDR;
 	unsigned int i;
 	for (i = 0; i < KV_INDEX_SIZE; i++) {
 		kvIndex[i].key = 0xFFFFFFFFu; // sentinel for empty
-		kvIndex[i].lba = 0;
+		// kvIndex[i].lba = 0;
 	}
 	kvIndex_inited = 1;
+	return;
 }
 
 // Insert or update key -> lsa mapping. Returns 0 on success, -1 if table full.
-static int kv_index_insert(unsigned int key, unsigned int lba)
+static int kv_index_insert(unsigned int key)
 {
 	unsigned int idx, i, pos;
 
@@ -102,20 +105,20 @@ static int kv_index_insert(unsigned int key, unsigned int lba)
 		pos = (idx + i) % KV_INDEX_SIZE;
 		if (kvIndex[pos].key == 0xFFFFFFFFu) {
 			kvIndex[pos].key = key;
-			kvIndex[pos].lba = lba;
-			return 0;
+			// kvIndex[pos].lba = lba;
+			return pos;
 		}
 		if (kvIndex[pos].key == key) {
 			// update existing
-			kvIndex[pos].lba = lba;
-			return 0;
+			// kvIndex[pos].lba = lba;
+			return pos;
 		}
 	}
 	return -1; // table full
 }
 
-// Find key -> set *out_lsa and return 1 if found, 0 if not found
-static int kv_index_find(unsigned int key, unsigned int *out_lba)
+// Find key -> set *out_lba and return 1 if found, 0 if not found
+static int kv_index_find(unsigned int key)
 {
 	unsigned int idx, i, pos;
 
@@ -126,28 +129,28 @@ static int kv_index_find(unsigned int key, unsigned int *out_lba)
 	for (i = 0; i < KV_INDEX_SIZE; i++) {
 		pos = (idx + i) % KV_INDEX_SIZE;
 		if (kvIndex[pos].key == 0xFFFFFFFFu)
-			return 0; // empty slot -> not found
+			return -1; // empty slot -> not found
 		if (kvIndex[pos].key == key) {
-			*out_lba = kvIndex[pos].lba;
-			return 1;
+			// *out_lba = kvIndex[pos].lba;
+			return pos;
 		}
 	}
-	return 0;
+	return -1;
 }
 
 // Simple hash function: maps 4-byte key to LSA range
-static unsigned int HashKeyToLBA(unsigned int key)
-{
-	// MurmurHash3-inspired 32-bit finalizer
-	unsigned int hash = key;
-	hash ^= (hash >> 16);
-	hash *= 0x85ebca6b;
-	hash ^= (hash >> 13);
-	hash *= 0xc2b2ae35;
-	hash ^= (hash >> 16);
-	unsigned int slice = hash % SLICES_PER_SSD;
-	return slice * NVME_BLOCKS_PER_SLICE; // return start LBA of the slice
-}
+// static unsigned int HashKeyToLBA(unsigned int key)
+// {
+// 	// MurmurHash3-inspired 32-bit finalizer
+// 	unsigned int hash = key;
+// 	hash ^= (hash >> 16);
+// 	hash *= 0x85ebca6b;
+// 	hash ^= (hash >> 13);
+// 	hash *= 0xc2b2ae35;
+// 	hash ^= (hash >> 16);
+// 	unsigned int slice = hash % SLICES_PER_SSD;
+// 	return slice * NVME_BLOCKS_PER_SLICE; // return start LBA of the slice
+// }
 /* ========================================================== */
 void handle_nvme_io_read(unsigned int cmdSlotTag, NVME_IO_COMMAND *nvmeIOCmd)
 {
@@ -208,15 +211,15 @@ void handle_nvme_io_write(unsigned int cmdSlotTag, NVME_IO_COMMAND *nvmeIOCmd)
 void handle_nvme_io_kv_put(unsigned int cmdSlotTag, NVME_IO_COMMAND *nvmeIOCmd)
 {
 	unsigned int key = nvmeIOCmd->dword[10];        // cdw10: 4-byte key
-	unsigned int nlb = nvmeIOCmd->dword[12];        // cdw12: number of logical blocks (slices)
 	// unsigned int valueSize = nvmeIOCmd->dword[13]; // cdw13: actual value size (not used in minimal impl)
 	
 	// Hash key to logical slice address
-	unsigned int lba = HashKeyToLBA(key);
-
-	// Update in-memory KV index for faster GETs (ignore insertion failure)
-	(void)kv_index_insert(key, lba);
-
+	unsigned int lba = kv_index_insert(key); // Update in-memory KV index for faster GETs (ignore insertion failure)
+	// Debug: Print key-value PUT operation details
+	// xil_printf("[KV_PUT] Key=0x%08X, LBA=%u\r\n", key, lba);
+	if (lba == (unsigned int)-1) {
+		xil_printf("[KV_PUT] Warning: Index table full, key=0x%08X\r\n", key);
+	}
 	// Reuse existing write path (start LBA expected)
 	nvmeIOCmd->dword[10] = lba;
 	nvmeIOCmd->dword[11] = 0;
@@ -227,27 +230,30 @@ void handle_nvme_io_kv_put(unsigned int cmdSlotTag, NVME_IO_COMMAND *nvmeIOCmd)
 void handle_nvme_io_kv_get(unsigned int cmdSlotTag, NVME_IO_COMMAND *nvmeIOCmd)
 {
 	NVME_COMPLETION nvmeCPL;
+	nvmeCPL.dword[0] = 0;
+	nvmeCPL.specific = 0; // Data length for KV GET completion
 	unsigned int key = nvmeIOCmd->dword[10];
-	unsigned int nlb = nvmeIOCmd->dword[12];
+	unsigned int nsid = nvmeIOCmd->NSID;
 	
 	// First try in-memory KV index for a faster path
-	unsigned int lba;
-	unsigned int lsa;
-	if (!kv_index_find(key, &lba)) {
+	unsigned int lba=kv_index_find(key);
+	if (lba == (unsigned int)-1) {
 		//없으면
 		nvmeCPL.statusField.SC = ENOSUCHKEY;
 		nvmeCPL.statusField.SCT = SCT_VENDOR_SPECIFIC;
 		set_auto_nvme_cpl(cmdSlotTag, nvmeCPL.specific, nvmeCPL.statusFieldWord);
 		return;
 	}
+	// Debug: Print key-value GET operation details
+	// xil_printf("[KV_GET] Key=0x%08X, LBA=%u\r\n", key, lba);
 	ASSERT((nvmeIOCmd->PRP1[0] & 0x3) == 0 && (nvmeIOCmd->PRP2[0] & 0x3) == 0);
 	ASSERT(nvmeIOCmd->PRP1[1] < 0x10000 && nvmeIOCmd->PRP2[1] < 0x10000);
 	
-	// Queue KV GET request to FTL pipeline with auto-completion disabled
-	// DMA will complete without hardware auto-completion
-	// Manual completion must be sent later with specific=4096 (data length)
-	// Queue KV GET: pass start LBA (not slice index)
-	ReqTransNvmeToSliceKvGet(cmdSlotTag, lba, nlb);
+	// Apply same NSID offset as PUT (handle_nvme_io_write)
+	unsigned int actualLba = lba + (storageCapacity_L / USER_CHANNELS) * (nsid - 1);
+	
+	// Queue KV GET request to FTL pipeline
+	ReqTransNvmeToSliceKvGet(cmdSlotTag, actualLba, 0);
 }
 /* ==================================================== */
 
