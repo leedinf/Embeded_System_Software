@@ -53,6 +53,7 @@
 #include "xil_printf.h"
 #include "debug.h"
 #include "io_access.h"
+#include "../memory_map.h"
 
 #include "nvme.h"
 #include "host_lld.h"
@@ -62,92 +63,101 @@
 #include "../request_transform.h"
 #include "../address_translation.h"
 
-/* === Key-Value Store Implementation (ESS4116 Project 3) === */
+/* === Optimized Key-Value Store for 4M keys (ESS4116 Project 3) === */
 #define KEY_SIZE 4
 #define ENOSUCHKEY 0x7C1
 
-// Simple in-memory KV index (open-addressing, linear probing)
-// This is a lightweight index for mapping 4-byte keys -> LSA (logical slice addr)
-// It is not persistent across power cycles; it's an in-memory acceleration structure.
-#define KV_INDEX_SIZE (SLICES_PER_SSD) // 4,194,304 
+// Double Hashing implementation for better performance
+// Table size: 4,194,304 / 0.7 ≈ 5,991,863 → nearest prime = 5992439
+#define KV_INDEX_SIZE 5992439u  // 소수, ~70% load factor
+#define EMPTY_KEY 0xFFFFFFFFu
 
 typedef struct {
-	unsigned int key; // 0xFFFFFFFF = empty
-	unsigned int lba;
+	unsigned int key;
 } KV_INDEX_ENTRY;
 
-static KV_INDEX_ENTRY kvIndex[KV_INDEX_SIZE];
+static KV_INDEX_ENTRY *kvIndex;
 static unsigned int kvIndex_inited = 0;
+
+// 컴파일 타임 메모리 체크
+static char checkMemory[(RESERVED0_START_ADDR + KV_INDEX_SIZE * sizeof(KV_INDEX_ENTRY) <= RESERVED0_END_ADDR) ? 1 : -1];
+
+// MurmurHash3 finalizer - primary hash
+static inline unsigned int hash_primary(unsigned int key)
+{
+	key ^= key >> 16;
+	key *= 0x85ebca6b;
+	key ^= key >> 13;
+	key *= 0xc2b2ae35;
+	key ^= key >> 16;
+	return key % KV_INDEX_SIZE;
+}
+
+// Double hashing step (항상 홀수 반환하여 전체 테이블 순회 보장)
+static inline unsigned int hash_step(unsigned int key)
+{
+	key = (key ^ 61) ^ (key >> 16);
+	key = key + (key << 3);
+	key = key ^ (key >> 4);
+	key = key * 0x27d4eb2d;
+	key = key ^ (key >> 15);
+	return (key % (KV_INDEX_SIZE - 1)) | 1;  // 항상 홀수
+}
 
 static void kv_index_init(void)
 {
-	unsigned int i;
-	for (i = 0; i < KV_INDEX_SIZE; i++) {
-		kvIndex[i].key = 0xFFFFFFFFu; // sentinel for empty
-		kvIndex[i].lba = 0;
+	kvIndex = (KV_INDEX_ENTRY *)RESERVED0_START_ADDR;
+	for (unsigned int i = 0; i < KV_INDEX_SIZE; i++) {
+		kvIndex[i].key = EMPTY_KEY;
 	}
 	kvIndex_inited = 1;
 }
 
-// Insert or update key -> lsa mapping. Returns 0 on success, -1 if table full.
-static int kv_index_insert(unsigned int key, unsigned int lba)
+// Insert key, returns position on success, -1 if table full
+static int kv_index_insert(unsigned int key)
 {
-	unsigned int idx, i, pos;
-
 	if (!kvIndex_inited)
 		kv_index_init();
 
-	idx = key % KV_INDEX_SIZE;
-	for (i = 0; i < KV_INDEX_SIZE; i++) {
-		pos = (idx + i) % KV_INDEX_SIZE;
-		if (kvIndex[pos].key == 0xFFFFFFFFu) {
+	unsigned int idx = hash_primary(key);
+	unsigned int step = hash_step(key);
+
+	for (unsigned int i = 0; i < KV_INDEX_SIZE; i++) {
+		unsigned int pos = (idx + i * step) % KV_INDEX_SIZE;
+		
+		if (kvIndex[pos].key == EMPTY_KEY) {
 			kvIndex[pos].key = key;
-			kvIndex[pos].lba = lba;
-			return 0;
+			return pos;
 		}
+		
 		if (kvIndex[pos].key == key) {
-			// update existing
-			kvIndex[pos].lba = lba;
-			return 0;
+			return pos;  // 이미 존재
 		}
 	}
-	return -1; // table full
+	return -1;  // 테이블 가득 참
 }
 
-// Find key -> set *out_lsa and return 1 if found, 0 if not found
-static int kv_index_find(unsigned int key, unsigned int *out_lba)
+// Find key, returns position if found, -1 if not found
+static int kv_index_find(unsigned int key)
 {
-	unsigned int idx, i, pos;
-
 	if (!kvIndex_inited)
 		kv_index_init();
 
-	idx = key % KV_INDEX_SIZE;
-	for (i = 0; i < KV_INDEX_SIZE; i++) {
-		pos = (idx + i) % KV_INDEX_SIZE;
-		if (kvIndex[pos].key == 0xFFFFFFFFu)
-			return 0; // empty slot -> not found
-		if (kvIndex[pos].key == key) {
-			*out_lba = kvIndex[pos].lba;
-			return 1;
-		}
-	}
-	return 0;
-}
+	unsigned int idx = hash_primary(key);
+	unsigned int step = hash_step(key);
 
-// Simple hash function: maps 4-byte key to LSA range
-static unsigned int HashKeyToLBA(unsigned int key)
-{
-	// MurmurHash3-inspired 32-bit finalizer
-	unsigned int hash = key;
-	hash ^= (hash >> 16);
-	hash *= 0x85ebca6b;
-	hash ^= (hash >> 13);
-	hash *= 0xc2b2ae35;
-	hash ^= (hash >> 16);
-	unsigned int slice = hash % SLICES_PER_SSD;
-	return slice * NVME_BLOCKS_PER_SLICE; // return start LBA of the slice
+	for (unsigned int i = 0; i < KV_INDEX_SIZE; i++) {
+		unsigned int pos = (idx + i * step) % KV_INDEX_SIZE;
+		
+		if (kvIndex[pos].key == EMPTY_KEY)
+			return -1;
+		
+		if (kvIndex[pos].key == key)
+			return pos;
+	}
+	return -1;
 }
+/* ================================================================= */
 /* ========================================================== */
 void handle_nvme_io_read(unsigned int cmdSlotTag, NVME_IO_COMMAND *nvmeIOCmd)
 {
@@ -208,15 +218,15 @@ void handle_nvme_io_write(unsigned int cmdSlotTag, NVME_IO_COMMAND *nvmeIOCmd)
 void handle_nvme_io_kv_put(unsigned int cmdSlotTag, NVME_IO_COMMAND *nvmeIOCmd)
 {
 	unsigned int key = nvmeIOCmd->dword[10];        // cdw10: 4-byte key
-	unsigned int nlb = nvmeIOCmd->dword[12];        // cdw12: number of logical blocks (slices)
 	// unsigned int valueSize = nvmeIOCmd->dword[13]; // cdw13: actual value size (not used in minimal impl)
 	
 	// Hash key to logical slice address
-	unsigned int lba = HashKeyToLBA(key);
-
-	// Update in-memory KV index for faster GETs (ignore insertion failure)
-	(void)kv_index_insert(key, lba);
-
+	unsigned int lba = kv_index_insert(key); // Update in-memory KV index for faster GETs (ignore insertion failure)
+	// Debug: Print key-value PUT operation details
+	// xil_printf("[KV_PUT] Key=0x%08X, LBA=%u\r\n", key, lba);
+	if (lba == (unsigned int)-1) {
+		xil_printf("[KV_PUT] Warning: Index table full, key=0x%08X\r\n", key);
+	}
 	// Reuse existing write path (start LBA expected)
 	nvmeIOCmd->dword[10] = lba;
 	nvmeIOCmd->dword[11] = 0;
@@ -227,27 +237,30 @@ void handle_nvme_io_kv_put(unsigned int cmdSlotTag, NVME_IO_COMMAND *nvmeIOCmd)
 void handle_nvme_io_kv_get(unsigned int cmdSlotTag, NVME_IO_COMMAND *nvmeIOCmd)
 {
 	NVME_COMPLETION nvmeCPL;
+	nvmeCPL.dword[0] = 0;
+	nvmeCPL.specific = 0; // Data length for KV GET completion
 	unsigned int key = nvmeIOCmd->dword[10];
-	unsigned int nlb = nvmeIOCmd->dword[12];
+	unsigned int nsid = nvmeIOCmd->NSID;
 	
 	// First try in-memory KV index for a faster path
-	unsigned int lba;
-	unsigned int lsa;
-	if (!kv_index_find(key, &lba)) {
+	unsigned int lba=kv_index_find(key);
+	if (lba == (unsigned int)-1) {																																																																																																																																																																																																																																																																																																																																																																																																																																																																																																																																																															
 		//없으면
 		nvmeCPL.statusField.SC = ENOSUCHKEY;
 		nvmeCPL.statusField.SCT = SCT_VENDOR_SPECIFIC;
 		set_auto_nvme_cpl(cmdSlotTag, nvmeCPL.specific, nvmeCPL.statusFieldWord);
 		return;
 	}
+	// Debug: Print key-value GET operation details
+	// xil_printf("[KV_GET] Key=0x%08X, LBA=%u\r\n", key, lba);
 	ASSERT((nvmeIOCmd->PRP1[0] & 0x3) == 0 && (nvmeIOCmd->PRP2[0] & 0x3) == 0);
 	ASSERT(nvmeIOCmd->PRP1[1] < 0x10000 && nvmeIOCmd->PRP2[1] < 0x10000);
 	
-	// Queue KV GET request to FTL pipeline with auto-completion disabled
-	// DMA will complete without hardware auto-completion
-	// Manual completion must be sent later with specific=4096 (data length)
-	// Queue KV GET: pass start LBA (not slice index)
-	ReqTransNvmeToSliceKvGet(cmdSlotTag, lba, nlb);
+	// Apply same NSID offset as PUT (handle_nvme_io_write)
+	unsigned int actualLba = lba + (storageCapacity_L / USER_CHANNELS) * (nsid - 1);
+	
+	// Queue KV GET request to FTL pipeline
+	ReqTransNvmeToSliceKvGet(cmdSlotTag, actualLba, 0);
 }
 /* ==================================================== */
 
